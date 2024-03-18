@@ -1,0 +1,55 @@
+#version 450
+
+#define PI 3.14159
+
+layout (local_size_x = 16, local_size_y = 16) in;
+layout (binding = 0       ) uniform           sampler2D input_image;
+layout (binding = 1, rgba8) uniform writeonly image2D output_image;
+
+layout (binding=2) uniform data {
+    float sigma0;
+    float sigma1;
+};
+
+float gaussian(float sigma, float x, float y) {
+    float sigma2 = 2.0*sigma*sigma;
+    return (1.0f / sqrt(PI * sigma2)) * exp(-(x*x + y*y) / sigma2);
+}
+
+float gaussian(float sigma, vec3 x, vec3 x_i) {
+    vec3 color = x - x_i;
+    float sigma2 = 2.0*sigma*sigma;
+    return (1.0f / sqrt(PI * sigma2)) * exp(-(dot(color, color)) / sigma2);
+}
+
+void main()
+{	
+    vec2 image_dim = textureSize(input_image, 0);
+    vec4 center = texture(input_image, vec2(gl_GlobalInvocationID.xy/image_dim));
+    vec4 res = center;
+
+    const int radius = int(sigma0*3)/2;
+    vec3 color = res.rgb;
+
+    float gauss_sum = 0;
+
+    for(int i = -radius; i < radius; ++i) {
+        for(int j = -radius; j < radius; ++j) {
+            float gauss = gaussian(sigma0, i, j);
+            ivec2 offset = ivec2(i, j);
+            vec4 res = texture(input_image, vec2((offset + gl_GlobalInvocationID.xy)/image_dim));
+
+            float gauss_brightness = gaussian(sigma1, center.rgb, res.rgb);
+
+            gauss_sum += gauss*gauss_brightness;
+            color += res.rgb*gauss*gauss_brightness;
+        }
+    }
+
+    color /= gauss_sum;
+
+    res.rgb = color.rgb;
+
+    imageStore(output_image, ivec2(gl_GlobalInvocationID.xy), res);
+}
+
