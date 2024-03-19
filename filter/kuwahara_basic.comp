@@ -1,0 +1,64 @@
+#version 450
+
+#define WORKGROUP_SIZE 16
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = WORKGROUP_SIZE) in;
+
+layout(set = 0, binding = 0, rgba8) readonly  uniform image2D input_image;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D output_image;
+
+layout(binding = 2) uniform data {
+    uint radius;
+};
+
+float calc_luma(vec3 v) {
+    return 0.2126*v.r + 0.7152*v.b +  0.0722*v.g;
+}
+
+struct quadrant {
+    vec3 color;
+    float variance;
+};
+
+quadrant quadrant_variance(ivec2 uv, uint tile_width, int x_sign, int y_sign) { vec3 color_sum = vec3(0.0);
+    float samples = tile_width*tile_width;
+    float luma_sq = 0.0;
+
+    for(uint i = 0; i < tile_width; ++i) {
+        for(uint j = 0; j < tile_width; ++j) {
+            vec3 pixel = imageLoad(input_image, uv + ivec2(x_sign*i, y_sign*j)).rgb;
+            float luma = calc_luma(pixel);
+            luma_sq += luma*luma;
+            color_sum += pixel;
+        }
+    }
+
+    vec3 color_mean = color_sum/samples;
+    float luma_mean = calc_luma(color_mean);
+
+    quadrant q;
+    q.color = color_mean;
+    q.variance = abs(luma_sq/samples-luma_mean*luma_mean);
+
+    return q;
+}
+
+void main() {    
+    const ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+
+    const uint tile_width = max(radius/2, 1);
+
+    quadrant q1 = quadrant_variance(uv, tile_width,  1,  1);
+    quadrant q2 = quadrant_variance(uv, tile_width, -1,  1);
+    quadrant q3 = quadrant_variance(uv, tile_width, -1, -1);
+    quadrant q4 = quadrant_variance(uv, tile_width,  1, -1);
+
+    float variance = min(q1.variance, min(q2.variance, min(q3.variance, q4.variance)));
+
+    vec3 color = variance == q1.variance ? q1.color :
+                 variance == q2.variance ? q2.color :
+                 variance == q3.variance ? q3.color :
+                                           q4.color;
+
+    imageStore(output_image, uv, vec4(color.rgb, 1.0));
+}
