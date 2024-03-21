@@ -1,0 +1,167 @@
+#version 450
+
+#define WORKGROUP_SIZE 16
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = WORKGROUP_SIZE) in;
+
+layout(set = 0, binding = 0, rgba8) readonly  uniform image2D input_image;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D output_image;
+layout(set = 0, binding = 2, rgba8) readonly  uniform image2D structure_tensor;
+
+layout(binding = 3) uniform data {
+    int sharpness;
+    int kernel_radius;
+    /* When eccentricity = 0, we use a circle
+     * As eccentricity -> inf, the ellipse stretches
+     * Tunes between [0, 20], (> 20 and we get mostly imperceptible changes) */
+    float ellipse_eccentricity;
+};
+
+/* The number of sectors/slices each ellipse should have
+ * Greatly changes performance
+ * Set between [2, 8] */
+#define NUM_SECTORS 8
+
+vec2 calc_eigen_values(in vec3 structure_tensor) {
+    // Labeled as seen in the paper
+    const float f_xx = structure_tensor.x;
+    const float f_yy = structure_tensor.y;
+    const float f_xy = structure_tensor.z;
+
+    /* The structure tensor induces for a given point a quadratic
+     * form which measures the squared rate of change in direction
+     * of a vector 
+     * Solving det((gij))-lambda_iI) yields:*/
+    const float lambda_sqrt = sqrt(pow(f_xx - f_yy, 2) + 4.0*f_xy*f_xy);
+    const float lambda1 = (f_xx + f_yy + lambda_sqrt)/2.0;
+    const float lambda2 = (f_xx + f_yy - lambda_sqrt)/2.0;
+
+    return vec2(lambda1, lambda2);
+}
+
+vec2 calc_min_eigen_vector(in vec3 structure_tensor, in float eigen_value_1) {
+    // Labeled as seen in the paper
+    const float f_xx = structure_tensor.x;
+    const float f_yy = structure_tensor.y;
+    const float f_xy = structure_tensor.z;
+
+    vec2 min_eigen = vec2(eigen_value_1 - f_xx, -f_xy);
+    min_eigen = length(min_eigen) > 0 ? normalize (min_eigen) : vec2(0.0, 1.0);
+
+    return min_eigen;
+}
+
+void main() {
+    const ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+
+    // The structure tensor (g_ij) computed in the previous pass
+    vec3 structure_tensor = imageLoad(structure_tensor, uv).rgb ;
+    const vec2 eigen_values = calc_eigen_values(structure_tensor);
+
+    /* The eigen vector oriented in the direction of the minimum rate of change
+     *
+     * We selecting the *minimum eigen vector ('t' in the paper) to create our desired vector field
+     * Tracing the maximum eigen vector provides worse results */
+    const vec2 min_eigen = calc_min_eigen_vector(structure_tensor, eigen_values.x);
+
+    // Get the angle the minimum eigen vector points in (eigen_angle in the paper)
+    const float eigen_angle = atan(min_eigen.y, min_eigen.x);
+
+    // The anisotropy ranges from 0 to 1 where 0 = isotropic and 1 = anisotropic
+    const float anisotropy = (eigen_values.x + eigen_values.y > 0.0) ?
+                                (eigen_values.x - eigen_values.y ) / (eigen_values.x + eigen_values.y ) :
+                                0.0;
+
+
+    // Calculate the ellipse
+    const float alpha = 1/max(ellipse_eccentricity,.001);
+    float a = kernel_radius * clamp(( alpha + anisotropy) / alpha , 0.1, 2.0);
+    float b = kernel_radius * clamp(alpha / (alpha + anisotropy), 0.1, 2.0);
+    float cos_eigen = cos(eigen_angle);
+    float sin_eigen = sin(eigen_angle);
+
+    // Scale and rotational matrices to map to the ellipse
+    mat2 R = mat2(cos_eigen, -sin_eigen, sin_eigen, cos_eigen );
+    mat2 S = mat2 (0.5/a, 0.0, 0.0, 0.5/b);
+    mat2 SR = S * R;
+
+    // The max extreme of the ellipse [-max_x, max_x] and [-max_y, max_y]
+    const int max_x = int(sqrt(a*a * cos_eigen*cos_eigen + b*b * sin_eigen*sin_eigen));
+    const int max_y = int(sqrt(a*a * sin_eigen*sin_eigen + b*b * cos_eigen*cos_eigen));
+
+    float zeta = 2.0f / (kernel_radius / 2);
+
+    // How much sectors overlap with each other
+    // Tweakable, but "an appropriate bound = 2*pi/NUM_SECTORS"
+    float zeroCross = .5;
+    float sinZeroCross = sin(zeroCross);
+    float eta = (zeta + cos(zeroCross)) / (sinZeroCross * sinZeroCross);
+
+    // Weights mean and square to calculate variance
+    vec4 weighted_mean[NUM_SECTORS];
+    vec3 weighted_sq[NUM_SECTORS];
+
+    for (int k = 0; k < NUM_SECTORS; ++k) {
+        weighted_mean[k] = vec4(0.0f);
+        weighted_sq[k] = vec3(0.0f);
+    }
+
+    for (int y = -max_y; y <= max_y; ++y) {
+        for (int x = -max_x; x <= max_x; ++x){
+            vec2 v = SR*vec2(x, y);
+            // We sample in a rectangle but want to exclude outside the ellipse
+            // Note: We get good images and generally faster results with this removed
+            if (dot(v, v) > 0.25f) {
+                continue;
+            }
+            float sum = 0;
+            float weights[8]; // w_k
+            float z, vxx, vyy;
+            
+            // Calculate Polynomial Weights
+            vxx = zeta - eta * v.x * v.x;
+            vyy = zeta - eta * v.y * v.y;
+
+            z = max(0,  v.y + vxx); sum += weights[0] = z * z;
+            z = max(0, -v.x + vyy); sum += weights[2] = z * z;
+            z = max(0, -v.y + vxx); sum += weights[4] = z * z;
+            z = max(0,  v.x + vyy); sum += weights[6] = z * z;
+
+            v = sqrt(2.0f) / 2.0f * vec2(v.x - v.y, v.x + v.y);
+            vxx = zeta - eta * v.x * v.x;
+            vyy = zeta - eta * v.y * v.y;
+
+            z = max(0,  v.y + vxx); sum += weights[1] = z * z;
+            z = max(0, -v.x + vyy); sum += weights[3] = z * z;
+            z = max(0, -v.y + vxx); sum += weights[5] = z * z;
+            z = max(0,  v.x + vyy); sum += weights[7] = z * z;
+            
+            float g = exp(-3.125f * dot(v,v)) / sum;
+            vec3 color = imageLoad(input_image, uv + ivec2(x, y)).rgb;
+            
+            // Obtain weighted mean and variance for every sector of the ellipse
+            for (int k = 0; k < NUM_SECTORS; ++k) {
+                float weight = weights[k] * g;
+                weighted_mean[k] += vec4(color * weight, weight);
+                weighted_sq[k] += color * color * weight;
+            }
+        }
+    }
+
+    // Calculate the final color using our weights and weighted_sq
+    vec4 output_pixel = vec4(0.0f);
+    for (int k = 0; k < NUM_SECTORS; ++k) {
+        weighted_mean[k].rgb /= weighted_mean[k].w;
+        weighted_sq[k] = abs(weighted_sq[k] / weighted_mean[k].w - weighted_mean[k].rgb * weighted_mean[k].rgb);
+
+        float variance = weighted_sq[k].r + weighted_sq[k].g + weighted_sq[k].b;
+        float weight_factor = 1.0f / (1.0f + pow(abs(1000.0f * variance), 0.5f * sharpness));
+
+        output_pixel += vec4(weighted_mean[k].rgb * weight_factor, weight_factor);
+    }
+
+    output_pixel /= output_pixel.w;
+
+    imageStore(output_image, uv, output_pixel);
+
+}

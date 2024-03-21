@@ -1,0 +1,38 @@
+#version 450
+
+#define WORKGROUP_SIZE 16
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = WORKGROUP_SIZE) in;
+
+layout(set = 0, binding = 0, rgba8) readonly  uniform image2D input_image;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D output_image;
+
+void main()
+{
+    const ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+
+    /* Here we take the sobel operator of the image in the x and y direction and
+     * compute the structure tensor */
+
+    // f_x = S_x * f
+    vec3 f_x = (
+            -1.0 * imageLoad(input_image, uv + ivec2(-1.0, -1.0)).rgb +
+            -2.0 * imageLoad(input_image, uv + ivec2(-1.0,  0.0)).rgb +
+            -1.0 * imageLoad(input_image, uv + ivec2(-1.0,  1.0)).rgb +
+            +1.0 * imageLoad(input_image, uv + ivec2( 1.0, -1.0)).rgb +
+            +2.0 * imageLoad(input_image, uv + ivec2( 1.0,  0.0)).rgb +
+            +1.0 * imageLoad(input_image, uv + ivec2( 1.0,  1.0)).rgb) / 4.0;
+
+    // f_y = S_x * f
+    vec3 f_y = (
+            -1.0 * imageLoad(input_image, uv + ivec2(-1.0, -1.0)).rgb +
+            -2.0 * imageLoad(input_image, uv + ivec2( 0.0, -1.0)).rgb +
+            -1.0 * imageLoad(input_image, uv + ivec2( 1.0, -1.0)).rgb +
+            +1.0 * imageLoad(input_image, uv + ivec2(-1.0,  1.0)).rgb +
+            +2.0 * imageLoad(input_image, uv + ivec2( 0.0,  1.0)).rgb +
+            +1.0 * imageLoad(input_image, uv + ivec2( 1.0,  1.0)).rgb) / 4.0;
+
+    // Store the structure tensor described in the paper
+    vec3 output_pixel = vec3(dot(f_x, f_x), dot(f_y, f_y), dot(f_x, f_y));
+    imageStore(output_image, uv, vec4(output_pixel, 1.0));
+}
