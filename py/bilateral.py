@@ -1,6 +1,6 @@
 bilateral = dict(
     sigma0 = 20,
-    sigma1 = .15
+    sigma1 = .05
 )
 
 nodes = dict(
